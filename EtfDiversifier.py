@@ -5,6 +5,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 import time
 import xml.etree.ElementTree as ET
+import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
 
 def get_data_from_justetf(isin):
     try:
@@ -28,6 +32,20 @@ def get_data_from_justetf(isin):
         # Estrazione del nome dell'ETF
         name = soup.find("h1", {"id": "etf-title"}).text.strip()
 
+        # Trova tutti i tag <script>
+        script_tags = soup.find_all('script')
+
+        # Cerca "loadMoreSectors" e "loadMoreCountries" all'interno del contenuto dei tag <script>
+        countries_found = False
+        sector_found = False  # Flag per verificare se la stringa è stata trovata
+        for script in script_tags:
+            if script.string and "loadMoreSectors" in script.string:
+                sector_found = True
+            if script.string and "loadMoreCountries" in script.string:
+                countries_found = True
+            if sector_found and countries_found:
+                break
+
         # Estrazione dei dati generali
         general_data = get_general_data(soup)
 
@@ -35,19 +53,49 @@ def get_data_from_justetf(isin):
         countries_id = find_next_table_id(soup, " Countries ")
         countries_data = extract_data(soup, countries_id) if countries_id else {}
 
+        print("\nGeographic Exposure (Countries):")
+        for country, percentage in countries_data.items():
+            print(f"  - {country}: {percentage}%")
+
         # Integra i dati aggiuntivi dei "More Countries" tramite chiamata AJAX
-        more_countries_data = load_more_countries(isin, cookies)
-        if more_countries_data:
-            countries_data.update(more_countries_data)
+        if countries_found:
+            countries_start = time.time()
+            while True:
+                more_countries_data = load_more_countries(isin, cookies)
+                if more_countries_data == {}:
+                    continue
+                elif more_countries_data != countries_data or time.time() - countries_start > 20:
+                    break
+            if time.time() - countries_start > 20:
+                print("Dati non recuperati correttamente")
+            if more_countries_data:
+                countries_data.update(more_countries_data)
+        else:
+            print("Non ci sono countries aggiuntive")
 
         # Trova gli ID per i Settori
         sectors_id = find_next_table_id(soup, " Sectors ")
         sectors_data = extract_data(soup, sectors_id) if sectors_id else {}
 
+        print("\nSector Exposure:")
+        for sector, percentage in sectors_data.items():
+            print(f"  - {sector}: {percentage}%")
+
         # Integra i dati aggiuntivi dei "More Sectors" tramite chiamata AJAX
-        more_sectors_data = load_more_sectors(isin, cookies)
-        if more_sectors_data:
-            sectors_data.update(more_sectors_data)
+        if sector_found:
+            sector_start = time.time()
+            while True:
+                more_sectors_data = load_more_sectors(isin, cookies)
+                if more_sectors_data == {}:
+                    continue
+                elif more_sectors_data != sectors_data or time.time() - sector_start > 20:
+                    break
+            if time.time() - sector_start > 20:
+                print("Dati non recuperati correttamente")
+            if more_sectors_data:
+                sectors_data.update(more_sectors_data)
+        else:
+            print("Non ci sono sectors aggiuntivi")
 
         # Recupera il prezzo dell'ETF
         price_data = get_etf_price(isin, cookies)
@@ -55,18 +103,18 @@ def get_data_from_justetf(isin):
         # Output ordinato
         print("\nETF Name: ", name)
 
-        if price_data:
-            print("\nLatest Price:")
-            print(f"  - Price: {price_data['price']} EUR")
-            print(f"  - Date: {price_data['date']}")
-        else:
-            print("\nLatest Price:")
-            print("  - Price: Not available")
-            print("  - Date: Not available")
+        # if price_data:
+        #     print("\nLatest Price:")
+        #     print(f"  - Price: {price_data['price']} EUR")
+        #     print(f"  - Date: {price_data['date']}")
+        # else:
+        #     print("\nLatest Price:")
+        #     print("  - Price: Not available")
+        #     print("  - Date: Not available")
 
-        print("\nGeneral Data:")
-        for item in general_data:
-            print(f"  - {item['name']}: {item['value']}")
+        # print("\nGeneral Data:")
+        # for item in general_data:
+        #     print(f"  - {item['name']}: {item['value']}")
 
         print("\nGeographic Exposure (Countries):")
         for country, percentage in countries_data.items():
@@ -199,7 +247,7 @@ def load_more_sectors(isin, cookies):
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
             "wicket-ajax": "true",
             "wicket-ajax-baseurl": f"en/etf-profile.html?isin={isin}",
-            "wicket-focusedelementid": "id170",
+            # "wicket-focusedelementid": "id170",
             "x-requested-with": "XMLHttpRequest"
         }
         response = requests.get(base_url, params=params, headers=headers)
@@ -344,9 +392,161 @@ def get_etf_price(isin, cookies):
         print(f"Errore durante il recupero del prezzo: {e}")
         return None
 
-#MAIN
+# Inseriamo la funzione esistente per calcolare i dati di ciascun ISIN
+def get_etf_data_concurrently(isin_list):
+    def process_isin(isin_entry):
+        isin = isin_entry['isin']
+        quotes = isin_entry['quotes']
+        data = get_data_from_justetf(isin)
+        if data and data["Latest Price"]["Price"]:
+            # Calcola il valore totale per questo ETF
+            data["Total Value"] = quotes * data["Latest Price"]["Price"]
+            data["Quotes"] = quotes
+        else:
+            data["Total Value"] = 0
+            data["Quotes"] = quotes
+        return {isin: data}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(process_isin, isin): isin for isin in isin_list}
+        for future in futures:
+            result = future.result()
+            results.update(result)
+    return results
+
+# Funzione per calcolare esposizioni pesate
+def calculate_weighted_exposures(etf_data):
+    countries = {}
+    sectors = {}
+    total_portfolio_value = sum(etf["Total Value"] for etf in etf_data.values())
+
+    for data in etf_data.values():
+        if data["Total Value"] > 0:
+            weight = data["Total Value"] / total_portfolio_value
+            # Pesi per Countries
+            for country, percentage in data["Geographic Exposure"].items():
+                countries[country] = countries.get(country, 0) + percentage * weight
+            # Pesi per Sectors
+            for sector, percentage in data["Sector Exposure"].items():
+                sectors[sector] = sectors.get(sector, 0) + percentage * weight
+
+    return countries, sectors, total_portfolio_value
+
+def create_pie_chart(data, title, threshold=3):
+    # Raggruppa categorie minori se necessario
+    other_value = 0
+    filtered_data = {}
+    for key, value in data.items():
+        if value < threshold:
+            other_value += value
+        else:
+            filtered_data[key] = value
+
+    if other_value > 0:
+        filtered_data["Other"] = other_value
+
+    # Crea il grafico
+    labels = list(filtered_data.keys())
+    sizes = list(filtered_data.values())
+    explode = [0.1 if size < threshold else 0 for size in sizes]  # Evidenzia "Other" o categorie piccole
+
+    fig, ax = plt.subplots()
+    wedges, texts, autotexts = ax.pie(
+        sizes, labels=labels, autopct=lambda pct: f'{pct:.1f}%' if pct > 1 else '', 
+        startangle=90, textprops={'fontsize': 9}, pctdistance=0.85, explode=explode
+    )
+
+    # Aggiungi annotazioni esterne per mantenere i nomi visibili
+    for i, text in enumerate(texts):
+        if sizes[i] < threshold:
+            text.set_color('grey')  # Colora i testi piccoli in grigio
+        text.set_fontsize(10)
+
+    for autotext in autotexts:
+        autotext.set_fontsize(8)
+        autotext.set_color('black')  # Valori percentuali
+
+    # Disegna un cerchio centrale per creare l'effetto di "doughnut"
+    centre_circle = plt.Circle((0, 0), 0.70, fc='white')
+    fig.gca().add_artist(centre_circle)
+
+    # Titolo del grafico
+    plt.title(title, fontsize=14)
+
+    return fig
+
+
+
+# Main con Streamlit
+def main():
+    # st.title("ETF Portfolio Overview")
+
+    # # Recupera i dati degli ETF
+    # st.header("Portfolio Data")
+    # st.write("Sto recuperando i dati per gli ETF, attendere...")
+
+    isin_list = [#{'isin' : "LU2195226068", 'quotes' : 10},  # Amundi net zero euro
+            #  {'isin' : "IE00BHZPJ239", 'quotes' : 10},  # MSCI EM
+             {'isin' : "IE00BFNM3D14", 'quotes' : 10},  # MSCI EURO
+            #  {'isin' : "LU1437017350", 'quotes' : 10},  # AMUNDI EM
+            #  {'isin' : "IE00BHZPJ569", 'quotes' : 10},  # MSCI World
+            #  {'isin' : "IE00B3VWN393", 'quotes' : 10},  # Treasury 3-7yr
+            #  {'isin' : "IE00BH04GL39", 'quotes' : 10}, # Euro gov bonds
+            #   {'isin' : "IE00B5BMR087", 'quotes' : 10}, # S&P 500
+    ]
+    etf_data = get_etf_data_concurrently(isin_list)
+
+#    # Stampa i dati di countries e sectors per ogni ISIN
+#     for isin, data in etf_data.items():
+#         print(f"\nISIN: {isin}")
+#         print("Countries Exposure:")
+#         for country, percentage in data["Geographic Exposure"].items():
+#             print(f"  - {country}: {percentage}%")
+#         print("Sector Exposure:")
+#         for sector, percentage in data["Sector Exposure"].items():
+#             print(f"  - {sector}: {percentage}%")
+#     # Visualizza i dati degli ETF
+#     portfolio_value = 0
+#     # for isin, data in etf_data.items():
+#     #     st.subheader(f"ETF: {data['Name']}")
+#     #     st.write(f"Latest Price: {data['Latest Price']['Price']} EUR")
+#     #     st.write(f"Total Value: {data['Total Value']} EUR")
+#     #     st.write(f"Quotes: {data['Quotes']}")
+
+#     # Calcolo esposizioni
+#     countries, sectors, portfolio_value = calculate_weighted_exposures(etf_data)
+
+#     st.header("Portfolio Overview")
+#     st.write(f"Total Portfolio Value: {portfolio_value} EUR")
+
+#     # Crea due colonne per i grafici
+#     col1, col2 = st.columns(2)
+
+#     # Grafico per l'esposizione geografica
+#     with col1:
+#         st.subheader("Geographic Exposure")
+#         country_chart = create_pie_chart(countries, "Geographic Exposure by Countries")
+#         st.pyplot(country_chart)
+
+#     # Grafico per l'esposizione settoriale
+#     with col2:
+#         st.subheader("Sector Exposure")
+#         sector_chart = create_pie_chart(sectors, "Sector Exposure by Sectors")
+#         st.pyplot(sector_chart)
+
+# Esegui l'app Streamlit
+if __name__ == "__main__":
+    main()
 
 # Esempio di utilizzo
-# isin = "IE00B4L5Y983"  # Inserisci il codice ISIN dell'ETF
-isin = "IE00BH04GL39"
-data = get_data_from_justetf(isin)
+# isin_list = [{'isin' : "LU2195226068", 'quotes' : 18},  # Amundi net zero euro
+#              {'isin' : "IE00BHZPJ239", 'quotes' : 33},  # MSCI EM
+#              {'isin' : "IE00BFNM3D14", 'quotes' : 70},  # MSCI EURO
+#              {'isin' : "LU1437017350", 'quotes' : 1},  # AMUNDI EM
+#              {'isin' : "IE00BHZPJ569", 'quotes' : 163},  # MSCI World
+#              {'isin' : "IE00B3VWN393", 'quotes' : 16},  # Treasury 3-7yr
+#              {'isin' : "IE00BH04GL39", 'quotes' : 210}] # Euro gov bonds
+# # isin = "IE00B4L5Y983"  # Inserisci il codice ISIN dell'ETF
+# isin = "IE00BH04GL39"
+# data = get_data_from_justetf(isin)
